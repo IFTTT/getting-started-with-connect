@@ -2,39 +2,25 @@ import os
 import uuid
 from io import BytesIO
 from pathlib import Path
-from typing import Tuple
 
 import requests
 from PIL import Image
 from flask import Flask
 from flask import request
 
+# The url of your service. It is passed to Google Drive to be used for downloading a thumbnail.
+service_url = os.environ["IFTTT_SERVICE_URL"]
+# Your service secret key. Used to authenticate this client with Connect API.
 service_key = os.environ["IFTTT_SERVICE_KEY"]
 
 app = Flask(__name__)
 
 
+# A webhook request handler.
+# IFTTT will send this webhook when a new photo is added to a user's Google Drive.
 @app.route("/ifttt/v1/webhooks/trigger_subscription/fired", methods=["POST"])
 def handle_trigger_subscription_fired():
     # Extract event details from the incoming webhook request
-    connection_id, user_id, original_filename, photo_url = parse_request()
-
-    # Download the photo using the url from the webhook event
-    photo_bytes = download_photo(photo_url)
-
-    # Make a thumbnail and save it to static/thumbnails/ directory on your computer.
-    # This makes it available for download by Google Drive.
-    thumbnail_filename = make_thumbnail(photo_bytes)
-
-    # Run the Google Drive action that will make Google Drive download the thumbnail,
-    # effectively uploading the file from our computer to Google Drive.
-    schedule_upload(connection_id, user_id, original_filename, thumbnail_filename)
-
-    return ""
-
-
-def parse_request() -> Tuple[str, str, str, str]:
-    body = request.get_json()
     # Request body example:
     # {
     #     "sent_at": 1543520153824,
@@ -53,42 +39,45 @@ def parse_request() -> Tuple[str, str, str, str]:
     #     },
     #    "sent_at": 1569541305410
     # }
-    ingredients = body["event_data"]["ingredients"]
+    request_json = request.get_json()
+
+    # The id of your user (https://platform.ifttt.com/docs/api_reference#user-information)
+    user_id = request_json["data"]["user_id"]
+    # The id of this trigger's the connection
+    connection_id = request_json["data"]["connection_id"]
     # TODO: use slugs, not names
-    user_id = body["data"]["user_id"]
-    connection_id = body["data"]["connection_id"]
+    # The original photo file name (ex: My Graduation 01.jpg)
+    photo_filename = request_json["event_data"]["ingredients"]["Filename"]
+    # The download url for the photo
+    photo_url = request_json["event_data"]["ingredients"]["PhotoUrl"]
 
-    original_filename = ingredients["Filename"]
+    # Download the photo
+    photo_bytes = requests.get(photo_url).content
 
-    photo_url = ingredients["PhotoUrl"]
+    # Make a thumbnail
+    image = Image.open(BytesIO(photo_bytes))
+    image.thumbnail((128, 128))
+    thumbnail_filename = f"{uuid.uuid4()}.png"  # Use a random name to avoid collisions
+    # Save the thumbnail to static/thumbnails/ directory on your computer.
+    # This makes it available for download by Google Drive.
+    image.save(f"{app.root_path}/static/thumbnails/{thumbnail_filename}")
 
-    return connection_id, user_id, original_filename, photo_url
-
-
-def download_photo(photo_url: str) -> bytes:
-    return requests.get(photo_url).content
-
-
-def make_thumbnail(photo_bytes: bytes) -> str:
-    im = Image.open(BytesIO(photo_bytes))
-    im.thumbnail((128, 128))
-    thumbnail_filename = f"{uuid.uuid4()}.png"
-    im.save(f"{app.root_path}/static/thumbnails/{thumbnail_filename}")
-
-    return thumbnail_filename
-
-
-def schedule_upload(connection_id: str, user_id: str, original_filename: str, thumbnail_filename: str) -> None:
-    url = f"https://connect.ifttt.com/v2/connections/{connection_id}/actions/google_drive.upload_file_from_url_google_drive/run?user_id={user_id}"
+    # Run the Google Drive action that will make Google Drive download the thumbnail,
+    # effectively uploading the file from our computer to Google Drive.
+    action_run_url = f"https://connect.ifttt.com/v2/connections/{connection_id}/actions/google_drive.upload_file_from_url_google_drive/run?user_id={user_id}"
     headers = {
         "Content-Type": "application/json",
         f"IFTTT-Service-Key": service_key
     }
-    body = {
+    # Override the field values with the actual url and filename
+    action_run_body = {
         "fields": {
-            "url": f"https://image-processor.ngrok.io/static/thumbnails/{thumbnail_filename}",
-            "filename": str(Path(original_filename).with_suffix(".png"))
+            "url": f"{service_url}/static/thumbnails/{thumbnail_filename}",
+            "filename": str(Path(photo_filename).with_suffix(".png"))
         }
     }
 
-    requests.post(url, headers=headers, json=body)
+    r = requests.post(action_run_url, headers=headers, json=action_run_body)
+    r.raise_for_status()
+
+    return ""
